@@ -1,0 +1,11 @@
+title:
+  en_us: Renumber\nSheets
+  ru: Перенумерация листов
+tooltip:
+  en_us: >-
+    Flexibly renumber selected sheets with sorting, manual ordering,
+    prefix, suffix, start, step, padding, preview, and conflict checks.
+  ru: >-
+    Гибкая перенумерация выбранных листов: сортировка и ручной порядок,
+    префикс, суффикс, старт, шаг, разрядность, предпросмотр и проверка конфликтов.
+author: OpenAI Codex
