@@ -9,7 +9,7 @@ import clr
 clr.AddReference("System.Drawing")
 clr.AddReference("System.Windows.Forms")
 
-from System import Guid
+from System import Guid, IntPtr
 from System.Drawing import Color, Point, Size
 from System.Windows.Forms import (
     AnchorStyles,
@@ -63,6 +63,8 @@ LVM_GETHEADER = 0x101F
 LVM_SETEXTENDEDLISTVIEWSTYLE = 0x1036
 LVS_EX_DOUBLEBUFFER = 0x00010000
 GROUP_DRAG_FORMAT = "PyRevit.SheetRenumber.Group"
+WM_NCHITTEST = 0x0084
+HTTRANSPARENT = -1
 
 
 class NativeRect(ctypes.Structure):
@@ -72,6 +74,16 @@ class NativeRect(ctypes.Structure):
         ("Right", ctypes.c_long),
         ("Bottom", ctypes.c_long),
     ]
+
+
+class DropIndicatorPanel(Panel):
+    """Overlay that never steals drag events from the native ListView."""
+
+    def WndProc(self, message):
+        if message.Msg == WM_NCHITTEST:
+            message.Result = IntPtr(HTTRANSPARENT)
+            return
+        Panel.WndProc(self, message)
 
 try:
     _send_message = ctypes.windll.user32.SendMessageW
@@ -703,7 +715,7 @@ class RenumberSheetsForm(Form):
         if self.sheet_list.IsHandleCreated:
             self.on_sheet_list_handle_created(self.sheet_list, None)
 
-        self.drop_indicator = Panel()
+        self.drop_indicator = DropIndicatorPanel()
         self.drop_indicator.BackColor = Color.Black
         self.drop_indicator.Height = 2
         self.drop_indicator.Visible = False
@@ -990,7 +1002,7 @@ class RenumberSheetsForm(Form):
         if header_group is not None:
             return header_group
 
-        item = self.sheet_list.GetItemAt(point.X, point.Y)
+        item = self._item_at_y(point.Y)
         if item is not None:
             return self._sheet_group_value(item.Tag)
 
@@ -1051,6 +1063,37 @@ class RenumberSheetsForm(Form):
 
     def _items(self):
         return [item for item in self.sheet_list.Items]
+
+    def _item_at_y(self, y, items=None):
+        """Find a visual row by Y, independent of columns and empty X space."""
+        if items is None:
+            items = self._items()
+        visible_items = []
+        for item in items:
+            bounds = item.Bounds
+            if bounds.Height <= 0:
+                continue
+            visible_items.append(item)
+            if bounds.Top <= y < bounds.Bottom:
+                return item
+
+        # Native ListView grid lines can leave a one-pixel gap where no item
+        # owns the cursor. Treat a small gap as part of the nearest row instead
+        # of briefly falling back to the bottom of the group.
+        nearest_item = None
+        nearest_distance = None
+        for item in visible_items:
+            bounds = item.Bounds
+            if y < bounds.Top:
+                distance = bounds.Top - y
+            else:
+                distance = y - bounds.Bottom + 1
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_item = item
+                nearest_distance = distance
+        if nearest_distance is not None and nearest_distance <= 3:
+            return nearest_item
+        return None
 
     def _checked_items(self):
         return [item for item in self.sheet_list.Items if item.Checked]
@@ -1274,6 +1317,7 @@ class RenumberSheetsForm(Form):
     def _begin_group_drag(self, group_value):
         if group_value is None or self._dragged_group_value is not None:
             return
+        self._hide_drop_marker()
         self._group_drag_candidate = None
         self._group_drag_start = None
         self._dragged_group_value = group_value
@@ -1332,6 +1376,7 @@ class RenumberSheetsForm(Form):
 
         self._group_drag_candidate = None
         self._group_drag_start = None
+        self._hide_drop_marker()
 
         selected_items = [
             item for item in self.sheet_list.Items if item.Selected
@@ -1397,22 +1442,14 @@ class RenumberSheetsForm(Form):
             self._drop_indicator_animation_timer.Stop()
             return
 
-        current_y = self.drop_indicator.Top
-        distance = target_y - current_y
+        distance = target_y - self.drop_indicator.Top
         if abs(distance) <= 1:
             self.drop_indicator.Top = target_y
             self._drop_indicator_animation_timer.Stop()
             return
 
-        step = min(8, max(2, abs(distance)))
-        next_y = current_y + (step if distance > 0 else -step)
-        if (distance > 0 and next_y > target_y) or (
-            distance < 0 and next_y < target_y
-        ):
-            next_y = target_y
-        self.drop_indicator.Top = next_y
-        if next_y == target_y:
-            self._drop_indicator_animation_timer.Stop()
+        step = max(1, min(6, int(abs(distance) * 0.35)))
+        self.drop_indicator.Top += step if distance > 0 else -step
 
     def _show_drop_marker(self, item, appears_after):
         if item is None:
@@ -1433,16 +1470,43 @@ class RenumberSheetsForm(Form):
             self.drop_indicator.SetBounds(0, boundary_y, marker_width, 2)
             self.drop_indicator.Visible = True
             self.drop_indicator.BringToFront()
-        else:
-            if self.drop_indicator.Left != 0:
-                self.drop_indicator.Left = 0
-            if self.drop_indicator.Width != marker_width:
-                self.drop_indicator.Width = marker_width
-            if self.drop_indicator.Top != boundary_y:
-                if not self._drop_indicator_animation_timer.Enabled:
-                    self._drop_indicator_animation_timer.Start()
-            elif self._drop_indicator_animation_timer.Enabled:
+            return
+
+        if self.drop_indicator.Left != 0:
+            self.drop_indicator.Left = 0
+        if self.drop_indicator.Width != marker_width:
+            self.drop_indicator.Width = marker_width
+        if self.drop_indicator.Height != 2:
+            self.drop_indicator.Height = 2
+        if abs(self.drop_indicator.Top - boundary_y) > 48:
+            self.drop_indicator.Top = boundary_y
+            if self._drop_indicator_animation_timer.Enabled:
                 self._drop_indicator_animation_timer.Stop()
+        elif self.drop_indicator.Top != boundary_y:
+            if not self._drop_indicator_animation_timer.Enabled:
+                self._drop_indicator_animation_timer.Start()
+        elif self._drop_indicator_animation_timer.Enabled:
+            self._drop_indicator_animation_timer.Stop()
+
+    def _cursor_appears_after(
+        self,
+        item,
+        cursor_y,
+        previous_boundary_y=None,
+    ):
+        """Choose a row boundary with a small midpoint dead zone."""
+        bounds = item.Bounds
+        midpoint = bounds.Top + bounds.Height // 2
+        hysteresis = max(2, min(5, bounds.Height // 5))
+        if previous_boundary_y is None and self.drop_indicator.Visible:
+            previous_boundary_y = self._drop_indicator_target_y
+
+        if previous_boundary_y is not None:
+            if abs(previous_boundary_y - bounds.Top) <= 1:
+                return cursor_y > midpoint + hysteresis
+            if abs(previous_boundary_y - bounds.Bottom) <= 1:
+                return cursor_y >= midpoint - hysteresis
+        return cursor_y > midpoint
 
     def _group_drop_boundaries(self):
         group_ranges = self._list_group_ranges()
@@ -1532,8 +1596,8 @@ class RenumberSheetsForm(Form):
             self._show_drop_marker(items[destination_index], False)
 
     def _update_drag_marker(self, point):
-        target = self.sheet_list.GetItemAt(point.X, point.Y)
         items = self._items()
+        target = self._item_at_y(point.Y, items)
         dragged_items = [
             item for item in self._dragged_items if item in items
         ]
@@ -1542,12 +1606,20 @@ class RenumberSheetsForm(Form):
         if target is None and target_group is not None:
             target_group_items = self._group_items(target_group, items)
             if target_group_items:
-                first_item = target_group_items[0]
-                last_item = target_group_items[-1]
+                first_item = min(
+                    target_group_items,
+                    key=lambda item: item.Bounds.Top,
+                )
+                last_item = max(
+                    target_group_items,
+                    key=lambda item: item.Bounds.Bottom,
+                )
                 if point.Y < first_item.Bounds.Top:
                     self._show_drop_marker(first_item, False)
-                else:
+                elif point.Y > last_item.Bounds.Bottom:
                     self._show_drop_marker(last_item, True)
+                # Inside a group, a transient empty hit is a grid-line gap.
+                # Keep the current marker rather than flashing at group end.
                 return
 
         if len(dragged_items) > 1:
@@ -1558,8 +1630,9 @@ class RenumberSheetsForm(Form):
                 len(source_groups) == 1 and target_group in source_groups
             )
             if not same_group_move and target is not None:
-                cursor_after = (
-                    point.Y > target.Bounds.Top + target.Bounds.Height / 2
+                cursor_after = self._cursor_appears_after(
+                    target,
+                    point.Y,
                 )
                 self._show_drop_marker(target, cursor_after)
                 return
@@ -1597,10 +1670,16 @@ class RenumberSheetsForm(Form):
             return
 
         if target in dragged_items:
+            cursor_after = self._cursor_appears_after(
+                target,
+                point.Y,
+            )
+            self._show_drop_marker(target, cursor_after)
             return
 
-        cursor_after = (
-            point.Y > target.Bounds.Top + target.Bounds.Height / 2
+        cursor_after = self._cursor_appears_after(
+            target,
+            point.Y,
         )
         appears_after = should_drop_after(
             items,
@@ -1717,6 +1796,11 @@ class RenumberSheetsForm(Form):
     def on_drag_drop(self, sender, args):
         del sender
         self._stop_drag_scroll()
+        previous_boundary_y = (
+            self._drop_indicator_target_y
+            if self._drop_indicator_target_y is not None
+            else None
+        )
         self._hide_drop_marker()
         if self._is_group_drag_data(args.Data):
             self._move_group_to_index(
@@ -1739,7 +1823,7 @@ class RenumberSheetsForm(Form):
             return
 
         point = self.sheet_list.PointToClient(Point(args.X, args.Y))
-        target = self.sheet_list.GetItemAt(point.X, point.Y)
+        target = self._item_at_y(point.Y, items)
         target_group = self._group_value_at_point(point)
         if target_group is None:
             return
@@ -1754,7 +1838,11 @@ class RenumberSheetsForm(Form):
         if moving_between_groups:
             if target is not None and target not in dragged_items:
                 target_index = items.index(target)
-                if point.Y > target.Bounds.Top + target.Bounds.Height / 2:
+                if self._cursor_appears_after(
+                    target,
+                    point.Y,
+                    previous_boundary_y,
+                ):
                     target_index += 1
             else:
                 target_group_items = self._group_items(target_group, items)
@@ -1819,8 +1907,10 @@ class RenumberSheetsForm(Form):
                 target_index = len(items)
         else:
             target_index = items.index(target)
-            cursor_after = (
-                point.Y > target.Bounds.Top + target.Bounds.Height / 2
+            cursor_after = self._cursor_appears_after(
+                target,
+                point.Y,
+                previous_boundary_y,
             )
             if should_drop_after(
                 items,
